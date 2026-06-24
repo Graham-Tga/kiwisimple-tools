@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller build artifacts (the .exe ships via GitHub Releases, not the repo)
+build/
+dist/
+*.spec
