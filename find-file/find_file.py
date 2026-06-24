@@ -22,7 +22,7 @@ from tkinter import ttk, filedialog, messagebox
 
 APP_TITLE = "Kiwi Simple - Find File"
 BRAND_URL = "https://kiwisimple.nz"
-VERSION = "1.1"
+VERSION = "1.2"
 
 # On-brand colours (Kiwi Simple indigo)
 INDIGO = "#3949AB"
@@ -30,7 +30,6 @@ INDIGO_D = "#283593"
 BG = "#E8EAF6"
 SCOPEBAR = "#C5CAE9"
 RED = "#C62828"
-RED_D = "#8E1F1F"
 TEXT = "#1a1a1a"
 MUTED = "#555555"
 
@@ -40,7 +39,8 @@ CACHE_DIR = os.path.join(
 CACHE_FILE = os.path.join(CACHE_DIR, "index.txt")
 META_FILE = os.path.join(CACHE_DIR, "meta.json")
 
-MAX_RESULTS = 2000  # cap rows shown so the list stays snappy
+MAX_RESULTS = 2000     # rows shown
+COLLECT_CAP = 30000    # matches gathered for sorting before we stop looking
 
 
 # ----------------------------------------------------------------------------
@@ -52,11 +52,10 @@ def fixed_drives():
 
 
 def scan_paths(roots, on_progress=None, should_stop=None):
-    """Recursively walk `roots` with os.scandir, returning a list of file paths.
+    """Recursively walk `roots`, returning a list of (path, mtime) tuples.
 
-    Skips folders we can't read (permission/OS errors) silently. Iterative (no
-    recursion limit). `on_progress(count)` is called occasionally; `should_stop()`
-    can abort early.
+    On Windows os.scandir already carries stat data, so entry.stat() is free.
+    Skips folders we can't read silently. Iterative (no recursion limit).
     """
     out = []
     stack = list(roots)
@@ -72,7 +71,11 @@ def scan_paths(roots, on_progress=None, should_stop=None):
                         if entry.is_dir(follow_symlinks=False):
                             stack.append(entry.path)
                         else:
-                            out.append(entry.path)
+                            try:
+                                mtime = entry.stat(follow_symlinks=False).st_mtime
+                            except OSError:
+                                mtime = 0.0
+                            out.append((entry.path, mtime))
                             count += 1
                             if on_progress and count % 4000 == 0:
                                 on_progress(count)
@@ -99,36 +102,55 @@ def open_in_explorer(path):
             return False
 
 
-def load_cache():
+def fmt_date(mtime):
+    if not mtime:
+        return ""
     try:
+        return time.strftime("%d %b %Y  %H:%M", time.localtime(mtime))
+    except Exception:
+        return ""
+
+
+def load_cache():
+    """Return (items, meta) where items is a list of (path, mtime)."""
+    try:
+        items = []
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            paths = f.read().splitlines()
+            for line in f.read().splitlines():
+                if not line:
+                    continue
+                if "\t" in line:                     # new format: mtime<TAB>path
+                    m, p = line.split("\t", 1)
+                    try:
+                        items.append((p, float(m)))
+                    except ValueError:
+                        items.append((p, 0.0))
+                else:                                # old format: path only
+                    items.append((line, 0.0))
         meta = {}
         if os.path.exists(META_FILE):
             with open(META_FILE, "r", encoding="utf-8") as f:
                 meta = json.load(f)
-        return paths, meta
+        return items, meta
     except (OSError, ValueError):
         return [], None
 
 
-def save_cache(paths, roots):
+def save_cache(items, roots):
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            f.write("\n".join(paths))
+            f.write("\n".join(f"{int(m)}\t{p}" for p, m in items))
         with open(META_FILE, "w", encoding="utf-8") as f:
-            json.dump({"roots": roots, "count": len(paths), "when": time.time()}, f)
+            json.dump({"roots": roots, "count": len(items), "when": time.time()}, f)
     except OSError:
         pass
 
 
 def scope_text(roots):
-    """Human label for the current search scope."""
     if not roots:
         return ""
-    drives = fixed_drives()
-    if sorted(roots) == sorted(drives):
+    if sorted(roots) == sorted(fixed_drives()):
         return "Whole PC (" + ", ".join(roots) + ")"
     return ", ".join(roots)
 
@@ -139,14 +161,17 @@ def scope_text(roots):
 class FindFileApp:
     def __init__(self, root):
         self.root = root
-        self.index = []          # list of (name_lower, full_path)
+        self.index = []          # list of (name_lower, path, mtime)
+        self.results = []        # current filtered matches (same shape)
         self.scanning = False
         self.stop_flag = False
         self.last_roots = []
+        self.sort_col = None     # 'name' | 'modified' | 'folder' | None
+        self.sort_desc = False
 
         root.title(APP_TITLE)
-        root.geometry("880x600")
-        root.minsize(640, 460)
+        root.geometry("900x620")
+        root.minsize(660, 460)
         root.configure(bg=BG)
 
         self._build_ui()
@@ -162,70 +187,60 @@ class FindFileApp:
         style.configure("Treeview", rowheight=24, font=("Segoe UI", 10))
         style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
 
-        # Header
         header = tk.Frame(self.root, bg=INDIGO)
         header.pack(fill="x")
-        tk.Label(
-            header, text="🔎  Kiwi Simple — Find File", bg=INDIGO, fg="white",
-            font=("Segoe UI", 15, "bold"), pady=12, padx=14,
-        ).pack(side="left")
+        tk.Label(header, text="🔎  Kiwi Simple — Find File", bg=INDIGO, fg="white",
+                 font=("Segoe UI", 15, "bold"), pady=12, padx=14).pack(side="left")
 
-        # Controls
         ctrl = tk.Frame(self.root, bg=BG)
         ctrl.pack(fill="x", padx=14, pady=(12, 4))
-
-        self.folder_btn = tk.Button(
-            ctrl, text="📁 Scan a folder…", command=self.scan_folder, bg=INDIGO,
-            fg="white", relief="flat", padx=12, pady=6, font=("Segoe UI", 10, "bold"),
-            cursor="hand2")
+        self.folder_btn = tk.Button(ctrl, text="📁 Scan a folder…", command=self.scan_folder,
+                                    bg=INDIGO, fg="white", relief="flat", padx=12, pady=6,
+                                    font=("Segoe UI", 10, "bold"), cursor="hand2")
         self.folder_btn.pack(side="left")
-        self.all_btn = tk.Button(
-            ctrl, text="💽 Scan whole PC", command=self.scan_all, bg=INDIGO,
-            fg="white", relief="flat", padx=12, pady=6, font=("Segoe UI", 10, "bold"),
-            cursor="hand2")
+        self.all_btn = tk.Button(ctrl, text="💽 Scan whole PC", command=self.scan_all,
+                                 bg=INDIGO, fg="white", relief="flat", padx=12, pady=6,
+                                 font=("Segoe UI", 10, "bold"), cursor="hand2")
         self.all_btn.pack(side="left", padx=(8, 0))
-        self.rescan_btn = tk.Button(
-            ctrl, text="🔄 Rescan", command=self.rescan, bg="#9FA8DA", fg=INDIGO_D,
-            relief="flat", padx=12, pady=6, font=("Segoe UI", 10, "bold"),
-            cursor="hand2", state="disabled")
+        self.rescan_btn = tk.Button(ctrl, text="🔄 Rescan", command=self.rescan,
+                                    bg="#9FA8DA", fg=INDIGO_D, relief="flat", padx=12, pady=6,
+                                    font=("Segoe UI", 10, "bold"), cursor="hand2", state="disabled")
         self.rescan_btn.pack(side="left", padx=(8, 0))
-        self.stop_btn = tk.Button(
-            ctrl, text="⛔ Stop", command=self.stop_scan, bg=RED, fg="white",
-            relief="flat", padx=12, pady=6, font=("Segoe UI", 10, "bold"),
-            cursor="hand2", state="disabled")
+        self.stop_btn = tk.Button(ctrl, text="⛔ Stop", command=self.stop_scan, bg=RED,
+                                  fg="white", relief="flat", padx=12, pady=6,
+                                  font=("Segoe UI", 10, "bold"), cursor="hand2", state="disabled")
         self.stop_btn.pack(side="left", padx=(8, 0))
 
-        # Scope bar — ALWAYS shows what is currently selected / being searched
         self.scope_var = tk.StringVar(
             value="📂  No folder chosen yet — click “Scan a folder…” or “Scan whole PC”.")
-        self.scope_lbl = tk.Label(
-            self.root, textvariable=self.scope_var, bg=SCOPEBAR, fg=INDIGO_D,
-            font=("Segoe UI", 10, "bold"), anchor="w", padx=14, pady=9)
-        self.scope_lbl.pack(fill="x", padx=14, pady=(8, 0))
+        tk.Label(self.root, textvariable=self.scope_var, bg=SCOPEBAR, fg=INDIGO_D,
+                 font=("Segoe UI", 10, "bold"), anchor="w", padx=14, pady=9
+                 ).pack(fill="x", padx=14, pady=(8, 0))
 
-        # Search box
         sf = tk.Frame(self.root, bg=BG)
-        sf.pack(fill="x", padx=14, pady=(10, 4))
+        sf.pack(fill="x", padx=14, pady=(10, 2))
         tk.Label(sf, text="Type part of a file name:", bg=BG, fg=MUTED,
                  font=("Segoe UI", 10)).pack(anchor="w")
         self.search_var = tk.StringVar()
-        self.search_entry = tk.Entry(sf, textvariable=self.search_var,
-                                     font=("Segoe UI", 13), relief="flat",
-                                     highlightthickness=2, highlightbackground="#bbb",
-                                     highlightcolor=INDIGO)
+        self.search_entry = tk.Entry(sf, textvariable=self.search_var, font=("Segoe UI", 13),
+                                     relief="flat", highlightthickness=2,
+                                     highlightbackground="#bbb", highlightcolor=INDIGO)
         self.search_entry.pack(fill="x", ipady=7, pady=(4, 0))
         self.search_entry.bind("<KeyRelease>", self._on_type)
         self._debounce = None
+        tk.Label(self.root, text="Double-click a result to open it  ·  click a column heading to sort",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=14)
 
-        # Results
         rf = tk.Frame(self.root, bg=BG)
-        rf.pack(fill="both", expand=True, padx=14, pady=(8, 4))
-        cols = ("name", "folder")
+        rf.pack(fill="both", expand=True, padx=14, pady=(6, 4))
+        cols = ("name", "modified", "folder")
         self.tree = ttk.Treeview(rf, columns=cols, show="headings", selectmode="browse")
-        self.tree.heading("name", text="File")
-        self.tree.heading("folder", text="Location (double-click to open)")
-        self.tree.column("name", width=260, anchor="w")
-        self.tree.column("folder", width=560, anchor="w")
+        self.tree.heading("name", text="File", command=lambda: self.sort_by("name"))
+        self.tree.heading("modified", text="Date modified", command=lambda: self.sort_by("modified"))
+        self.tree.heading("folder", text="Location", command=lambda: self.sort_by("folder"))
+        self.tree.column("name", width=240, anchor="w")
+        self.tree.column("modified", width=150, anchor="w")
+        self.tree.column("folder", width=440, anchor="w")
         vsb = ttk.Scrollbar(rf, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -238,18 +253,15 @@ class FindFileApp:
         self.menu.add_command(label="Open in File Explorer", command=self._open_selected)
         self.menu.add_command(label="Copy full path", command=self._copy_selected)
 
-        # Status + brand footer
         sb = tk.Frame(self.root, bg=BG)
         sb.pack(fill="x", padx=14, pady=(0, 4))
-        self.status = tk.Label(sb, text="Ready.", bg=BG, fg=MUTED,
-                               font=("Segoe UI", 9), anchor="w")
+        self.status = tk.Label(sb, text="Ready.", bg=BG, fg=MUTED, font=("Segoe UI", 9), anchor="w")
         self.status.pack(side="left")
 
         foot = tk.Frame(self.root, bg="#d7dcf0")
         foot.pack(fill="x")
-        link = tk.Label(foot, text="More free tools at kiwisimple.nz",
-                        bg="#d7dcf0", fg=INDIGO_D, font=("Segoe UI", 9, "bold"),
-                        cursor="hand2", pady=6)
+        link = tk.Label(foot, text="More free tools at kiwisimple.nz", bg="#d7dcf0", fg=INDIGO_D,
+                        font=("Segoe UI", 9, "bold"), cursor="hand2", pady=6)
         link.pack()
         link.bind("<Button-1>", lambda e: self._open_url(BRAND_URL))
 
@@ -265,13 +277,13 @@ class FindFileApp:
 
     # --- scanning -----------------------------------------------------------
     def _load_existing_cache(self):
-        paths, meta = load_cache()
-        if paths:
-            self._set_index(paths)
+        items, meta = load_cache()
+        if items:
+            self._set_index(items)
             roots = (meta or {}).get("roots", [])
             self.last_roots = roots
             self.scope_var.set("📂  Searching in:  " + scope_text(roots)
-                               + f"   ·   {len(paths):,} files (from last scan)")
+                               + f"   ·   {len(items):,} files (from last scan)")
             self.status.config(text="Type part of a file name to search, or Rescan to refresh.")
             self.rescan_btn.config(state="normal")
             self.search_entry.focus_set()
@@ -302,7 +314,6 @@ class FindFileApp:
             self.scan_all()
 
     def stop_scan(self):
-        """Cancel a scan in progress so the user can change folders."""
         if self.scanning:
             self.stop_flag = True
             self.status.config(text="Stopping…")
@@ -321,42 +332,41 @@ class FindFileApp:
 
         def worker():
             t0 = time.time()
-            paths = scan_paths(
+            items = scan_paths(
                 roots,
                 on_progress=lambda c: self._post_status(f"Scanning… {c:,} files found"),
                 should_stop=lambda: self.stop_flag,
             )
             stopped = self.stop_flag
             if not stopped:
-                save_cache(paths, roots)
-            self.root.after(0, lambda: self._scan_done(paths, time.time() - t0, stopped))
+                save_cache(items, roots)
+            self.root.after(0, lambda: self._scan_done(items, time.time() - t0, stopped))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _post_status(self, text):
         self.root.after(0, lambda: self.status.config(text=text))
 
-    def _scan_done(self, paths, secs, stopped=False):
+    def _scan_done(self, items, secs, stopped=False):
         self.scanning = False
-        self._set_index(paths)
+        self._set_index(items)
         self._set_scanning_ui(False)
         roots_txt = scope_text(self.last_roots)
         if stopped:
             self.scope_var.set("⛔  Stopped — " + roots_txt
-                               + f"   ·   {len(paths):,} files found so far (partial)")
+                               + f"   ·   {len(items):,} files found so far (partial)")
             self.status.config(text="Stopped. Pick another folder, or search what was found.")
         else:
-            self.scope_var.set("📂  Searching in:  " + roots_txt
-                               + f"   ·   {len(paths):,} files")
-            self.status.config(text=f"Found {len(paths):,} files in {secs:0.1f}s. "
+            self.scope_var.set("📂  Searching in:  " + roots_txt + f"   ·   {len(items):,} files")
+            self.status.config(text=f"Found {len(items):,} files in {secs:0.1f}s. "
                                      f"Type part of a name to search.")
         self.search_entry.focus_set()
         self._do_search()
 
-    def _set_index(self, paths):
-        self.index = [(os.path.basename(p).lower(), p) for p in paths if p]
+    def _set_index(self, items):
+        self.index = [(os.path.basename(p).lower(), p, m) for p, m in items if p]
 
-    # --- search -------------------------------------------------------------
+    # --- search + sort ------------------------------------------------------
     def _on_type(self, event=None):
         if self._debounce:
             self.root.after_cancel(self._debounce)
@@ -365,25 +375,58 @@ class FindFileApp:
     def _do_search(self):
         self._debounce = None
         q = self.search_var.get().strip().lower()
-        self._clear_results()
+        self.results = []
         if not self.index:
+            self._clear_results()
             return
         if not q:
+            self._clear_results()
             self.status.config(text=f"{len(self.index):,} files ready. Type to search.")
             return
-        matches = []
-        for name_lower, path in self.index:
-            if q in name_lower:
-                matches.append(path)
-                if len(matches) > MAX_RESULTS:
+        capped = False
+        for tup in self.index:                    # (name_lower, path, mtime)
+            if q in tup[0]:
+                self.results.append(tup)
+                if len(self.results) >= COLLECT_CAP:
+                    capped = True
                     break
-        shown = matches[:MAX_RESULTS]
-        for p in shown:
-            self.tree.insert("", "end", values=(os.path.basename(p), p))
-        more = " (showing first %d)" % MAX_RESULTS if len(matches) > MAX_RESULTS else ""
-        self.status.config(
-            text=f"{len(shown):,} match" + ("" if len(shown) == 1 else "es") + more
-        )
+        self._capped = capped
+        self._render_results()
+
+    def sort_by(self, col):
+        if self.sort_col == col:
+            self.sort_desc = not self.sort_desc
+        else:
+            self.sort_col = col
+            self.sort_desc = (col == "modified")  # dates default newest-first
+        self._update_headings()
+        self._render_results()
+
+    def _update_headings(self):
+        arrow = " ▼" if self.sort_desc else " ▲"
+        for c, base in (("name", "File"), ("modified", "Date modified"), ("folder", "Location")):
+            self.tree.heading(c, text=base + (arrow if c == self.sort_col else ""))
+
+    def _render_results(self):
+        self._clear_results()
+        rows = self.results
+        if self.sort_col:
+            keyfn = {
+                "name": lambda t: t[0],
+                "modified": lambda t: t[2],
+                "folder": lambda t: t[1].lower(),
+            }[self.sort_col]
+            rows = sorted(rows, key=keyfn, reverse=self.sort_desc)
+        shown = rows[:MAX_RESULTS]
+        for name_lower, path, mtime in shown:
+            self.tree.insert("", "end", values=(os.path.basename(path), fmt_date(mtime), path))
+        total = len(self.results)
+        if getattr(self, "_capped", False):
+            self.status.config(text=f"Showing {len(shown):,} of {COLLECT_CAP:,}+ matches — "
+                                     f"type a bit more to narrow it down.")
+        else:
+            more = f" (showing first {MAX_RESULTS:,})" if total > MAX_RESULTS else ""
+            self.status.config(text=f"{total:,} match" + ("" if total == 1 else "es") + more)
 
     def _clear_results(self):
         for i in self.tree.get_children():
@@ -394,7 +437,7 @@ class FindFileApp:
         sel = self.tree.selection()
         if not sel:
             return None
-        return self.tree.item(sel[0], "values")[1]
+        return self.tree.item(sel[0], "values")[2]
 
     def _open_selected(self, event=None):
         path = self._selected_path()
