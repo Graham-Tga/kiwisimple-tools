@@ -22,13 +22,15 @@ from tkinter import ttk, filedialog, messagebox
 
 APP_TITLE = "Kiwi Simple - Find File"
 BRAND_URL = "https://kiwisimple.nz"
-VERSION = "1.0"
+VERSION = "1.1"
 
 # On-brand colours (Kiwi Simple indigo)
 INDIGO = "#3949AB"
 INDIGO_D = "#283593"
 BG = "#E8EAF6"
-CARD = "#ffffff"
+SCOPEBAR = "#C5CAE9"
+RED = "#C62828"
+RED_D = "#8E1F1F"
 TEXT = "#1a1a1a"
 MUTED = "#555555"
 
@@ -87,7 +89,6 @@ def open_in_explorer(path):
     """Open File Explorer with the file selected (the thing a browser can't do)."""
     path = os.path.normpath(path)
     try:
-        # string form is the reliable way to pass explorer's /select, syntax
         subprocess.Popen(f'explorer /select,"{path}"')
         return True
     except Exception:
@@ -99,7 +100,6 @@ def open_in_explorer(path):
 
 
 def load_cache():
-    """Return (paths, meta) from the on-disk cache, or ([], None)."""
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
             paths = f.read().splitlines()
@@ -123,6 +123,16 @@ def save_cache(paths, roots):
         pass
 
 
+def scope_text(roots):
+    """Human label for the current search scope."""
+    if not roots:
+        return ""
+    drives = fixed_drives()
+    if sorted(roots) == sorted(drives):
+        return "Whole PC (" + ", ".join(roots) + ")"
+    return ", ".join(roots)
+
+
 # ----------------------------------------------------------------------------
 # GUI
 # ----------------------------------------------------------------------------
@@ -132,15 +142,12 @@ class FindFileApp:
         self.index = []          # list of (name_lower, full_path)
         self.scanning = False
         self.stop_flag = False
+        self.last_roots = []
 
         root.title(APP_TITLE)
-        root.geometry("860x560")
-        root.minsize(640, 420)
+        root.geometry("880x600")
+        root.minsize(640, 460)
         root.configure(bg=BG)
-        try:
-            root.iconbitmap(default="")  # no .ico bundled; ignore if unavailable
-        except Exception:
-            pass
 
         self._build_ui()
         self._load_existing_cache()
@@ -167,23 +174,38 @@ class FindFileApp:
         ctrl = tk.Frame(self.root, bg=BG)
         ctrl.pack(fill="x", padx=14, pady=(12, 4))
 
-        tk.Button(ctrl, text="📁 Scan a folder…", command=self.scan_folder,
-                  bg=INDIGO, fg="white", relief="flat", padx=12, pady=6,
-                  font=("Segoe UI", 10, "bold"), cursor="hand2"
-                  ).pack(side="left")
-        tk.Button(ctrl, text="💽 Scan whole PC", command=self.scan_all,
-                  bg=INDIGO, fg="white", relief="flat", padx=12, pady=6,
-                  font=("Segoe UI", 10, "bold"), cursor="hand2"
-                  ).pack(side="left", padx=(8, 0))
-        self.rescan_btn = tk.Button(ctrl, text="🔄 Rescan", command=self.rescan,
-                                    bg="#C5CAE9", fg=INDIGO_D, relief="flat",
-                                    padx=12, pady=6, font=("Segoe UI", 10, "bold"),
-                                    cursor="hand2", state="disabled")
+        self.folder_btn = tk.Button(
+            ctrl, text="📁 Scan a folder…", command=self.scan_folder, bg=INDIGO,
+            fg="white", relief="flat", padx=12, pady=6, font=("Segoe UI", 10, "bold"),
+            cursor="hand2")
+        self.folder_btn.pack(side="left")
+        self.all_btn = tk.Button(
+            ctrl, text="💽 Scan whole PC", command=self.scan_all, bg=INDIGO,
+            fg="white", relief="flat", padx=12, pady=6, font=("Segoe UI", 10, "bold"),
+            cursor="hand2")
+        self.all_btn.pack(side="left", padx=(8, 0))
+        self.rescan_btn = tk.Button(
+            ctrl, text="🔄 Rescan", command=self.rescan, bg="#9FA8DA", fg=INDIGO_D,
+            relief="flat", padx=12, pady=6, font=("Segoe UI", 10, "bold"),
+            cursor="hand2", state="disabled")
         self.rescan_btn.pack(side="left", padx=(8, 0))
+        self.stop_btn = tk.Button(
+            ctrl, text="⛔ Stop", command=self.stop_scan, bg=RED, fg="white",
+            relief="flat", padx=12, pady=6, font=("Segoe UI", 10, "bold"),
+            cursor="hand2", state="disabled")
+        self.stop_btn.pack(side="left", padx=(8, 0))
+
+        # Scope bar — ALWAYS shows what is currently selected / being searched
+        self.scope_var = tk.StringVar(
+            value="📂  No folder chosen yet — click “Scan a folder…” or “Scan whole PC”.")
+        self.scope_lbl = tk.Label(
+            self.root, textvariable=self.scope_var, bg=SCOPEBAR, fg=INDIGO_D,
+            font=("Segoe UI", 10, "bold"), anchor="w", padx=14, pady=9)
+        self.scope_lbl.pack(fill="x", padx=14, pady=(8, 0))
 
         # Search box
         sf = tk.Frame(self.root, bg=BG)
-        sf.pack(fill="x", padx=14, pady=(8, 4))
+        sf.pack(fill="x", padx=14, pady=(10, 4))
         tk.Label(sf, text="Type part of a file name:", bg=BG, fg=MUTED,
                  font=("Segoe UI", 10)).pack(anchor="w")
         self.search_var = tk.StringVar()
@@ -203,7 +225,7 @@ class FindFileApp:
         self.tree.heading("name", text="File")
         self.tree.heading("folder", text="Location (double-click to open)")
         self.tree.column("name", width=260, anchor="w")
-        self.tree.column("folder", width=540, anchor="w")
+        self.tree.column("folder", width=560, anchor="w")
         vsb = ttk.Scrollbar(rf, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -212,7 +234,6 @@ class FindFileApp:
         self.tree.bind("<Return>", self._open_selected)
         self.tree.bind("<Button-3>", self._popup_menu)
 
-        # Right-click menu
         self.menu = tk.Menu(self.root, tearoff=0)
         self.menu.add_command(label="Open in File Explorer", command=self._open_selected)
         self.menu.add_command(label="Copy full path", command=self._copy_selected)
@@ -220,8 +241,8 @@ class FindFileApp:
         # Status + brand footer
         sb = tk.Frame(self.root, bg=BG)
         sb.pack(fill="x", padx=14, pady=(0, 4))
-        self.status = tk.Label(sb, text="Choose a folder, or scan your whole PC, to begin.",
-                               bg=BG, fg=MUTED, font=("Segoe UI", 9), anchor="w")
+        self.status = tk.Label(sb, text="Ready.", bg=BG, fg=MUTED,
+                               font=("Segoe UI", 9), anchor="w")
         self.status.pack(side="left")
 
         foot = tk.Frame(self.root, bg="#d7dcf0")
@@ -232,22 +253,28 @@ class FindFileApp:
         link.pack()
         link.bind("<Button-1>", lambda e: self._open_url(BRAND_URL))
 
+    # --- button / scope state ----------------------------------------------
+    def _set_scanning_ui(self, scanning):
+        self.folder_btn.config(state="disabled" if scanning else "normal")
+        self.all_btn.config(state="disabled" if scanning else "normal")
+        self.stop_btn.config(state="normal" if scanning else "disabled")
+        if scanning:
+            self.rescan_btn.config(state="disabled")
+        else:
+            self.rescan_btn.config(state="normal" if self.last_roots else "disabled")
+
     # --- scanning -----------------------------------------------------------
     def _load_existing_cache(self):
         paths, meta = load_cache()
         if paths:
             self._set_index(paths)
             roots = (meta or {}).get("roots", [])
-            self.status.config(
-                text=f"Loaded {len(paths):,} files from last scan"
-                     + (f" of {', '.join(roots)}" if roots else "")
-                     + ". Type to search, or Rescan to refresh."
-            )
-            self.rescan_btn.config(state="normal")
             self.last_roots = roots
+            self.scope_var.set("📂  Searching in:  " + scope_text(roots)
+                               + f"   ·   {len(paths):,} files (from last scan)")
+            self.status.config(text="Type part of a file name to search, or Rescan to refresh.")
+            self.rescan_btn.config(state="normal")
             self.search_entry.focus_set()
-        else:
-            self.last_roots = []
 
     def scan_folder(self):
         folder = filedialog.askdirectory(title="Choose a folder to search")
@@ -263,16 +290,23 @@ class FindFileApp:
             APP_TITLE,
             "Scan your whole PC (" + ", ".join(drives) + ")?\n\n"
             "The first scan can take up to a minute on a big drive. "
-            "After that it is saved, so searches are instant.",
+            "You can press Stop at any time.",
         ):
             return
         self._start_scan(drives)
 
     def rescan(self):
-        if getattr(self, "last_roots", None):
+        if self.last_roots:
             self._start_scan(self.last_roots)
         else:
             self.scan_all()
+
+    def stop_scan(self):
+        """Cancel a scan in progress so the user can change folders."""
+        if self.scanning:
+            self.stop_flag = True
+            self.status.config(text="Stopping…")
+            self.scope_var.set("⛔  Stopping…")
 
     def _start_scan(self, roots):
         if self.scanning:
@@ -280,9 +314,10 @@ class FindFileApp:
         self.scanning = True
         self.stop_flag = False
         self.last_roots = roots
-        self.rescan_btn.config(state="disabled")
+        self._set_scanning_ui(True)
         self._clear_results()
-        self.status.config(text="Scanning… " + ", ".join(roots))
+        self.scope_var.set("📂  Scanning:  " + scope_text(roots) + "  …")
+        self.status.config(text="Reading the folder… (press Stop to cancel)")
 
         def worker():
             t0 = time.time()
@@ -291,23 +326,32 @@ class FindFileApp:
                 on_progress=lambda c: self._post_status(f"Scanning… {c:,} files found"),
                 should_stop=lambda: self.stop_flag,
             )
-            save_cache(paths, roots)
-            self.root.after(0, lambda: self._scan_done(paths, time.time() - t0))
+            stopped = self.stop_flag
+            if not stopped:
+                save_cache(paths, roots)
+            self.root.after(0, lambda: self._scan_done(paths, time.time() - t0, stopped))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _post_status(self, text):
         self.root.after(0, lambda: self.status.config(text=text))
 
-    def _scan_done(self, paths, secs):
+    def _scan_done(self, paths, secs, stopped=False):
         self.scanning = False
         self._set_index(paths)
-        self.rescan_btn.config(state="normal")
-        self.status.config(
-            text=f"Found {len(paths):,} files in {secs:0.1f}s. Type part of a name to search."
-        )
+        self._set_scanning_ui(False)
+        roots_txt = scope_text(self.last_roots)
+        if stopped:
+            self.scope_var.set("⛔  Stopped — " + roots_txt
+                               + f"   ·   {len(paths):,} files found so far (partial)")
+            self.status.config(text="Stopped. Pick another folder, or search what was found.")
+        else:
+            self.scope_var.set("📂  Searching in:  " + roots_txt
+                               + f"   ·   {len(paths):,} files")
+            self.status.config(text=f"Found {len(paths):,} files in {secs:0.1f}s. "
+                                     f"Type part of a name to search.")
         self.search_entry.focus_set()
-        self._on_type()
+        self._do_search()
 
     def _set_index(self, paths):
         self.index = [(os.path.basename(p).lower(), p) for p in paths if p]
@@ -337,7 +381,9 @@ class FindFileApp:
         for p in shown:
             self.tree.insert("", "end", values=(os.path.basename(p), p))
         more = " (showing first %d)" % MAX_RESULTS if len(matches) > MAX_RESULTS else ""
-        self.status.config(text=f"{len(shown):,} match" + ("" if len(shown) == 1 else "es") + more)
+        self.status.config(
+            text=f"{len(shown):,} match" + ("" if len(shown) == 1 else "es") + more
+        )
 
     def _clear_results(self):
         for i in self.tree.get_children():
